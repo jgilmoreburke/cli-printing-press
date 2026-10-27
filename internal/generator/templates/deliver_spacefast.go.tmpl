@@ -16,7 +16,8 @@ package cli
 // private link and a claim link, and the page's key is kept in this CLI's
 // state directory so a later --deliver to the same <name> updates the same
 // page instead of creating another. Remembered pages are scoped to the API
-// address, credential, and team they were published with.
+// address, credential, and team they were published with, and each one is its
+// own file, so concurrent deliveries never rewrite each other's records.
 
 import (
 	"bytes"
@@ -42,7 +43,7 @@ import (
 
 const (
 	spacefastDefaultAPI    = "https://api.spacefast.com"
-	spacefastStateFile     = "spacefast-deliveries.json"
+	spacefastStateDir      = "spacefast-deliveries"
 	spacefastMaxTableRows  = 2000
 	spacefastMaxTableCols  = 24
 	spacefastClientVersion = "{{.Name}}-pp-cli/deliver"
@@ -96,82 +97,44 @@ func spacefastScope(api, token, team string) string {
 	return api + "|token:" + hex.EncodeToString(sum[:8]) + "|team:" + team
 }
 
-func spacefastStatePath() (string, error) {
-	dir, err := cliutil.StateDir()
+// spacefastDeliveryPath returns the file that remembers one page. Each page
+// gets its own file, named by a hash of its scope and name, so there is no
+// shared file to read-modify-write and no lock to recover.
+func spacefastDeliveryPath(stateKey string) (dir, name string, err error) {
+	base, err := cliutil.StateDir()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return filepath.Join(dir, spacefastStateFile), nil
+	sum := sha256.Sum256([]byte(stateKey))
+	return filepath.Join(base, spacefastStateDir), hex.EncodeToString(sum[:16]) + ".json", nil
 }
 
-func loadSpacefastDeliveries() map[string]spacefastDelivery {
-	out := map[string]spacefastDelivery{}
-	path, err := spacefastStatePath()
+func loadSpacefastDelivery(stateKey string) (spacefastDelivery, bool) {
+	var d spacefastDelivery
+	dir, name, err := spacefastDeliveryPath(stateKey)
 	if err != nil {
-		return out
+		return d, false
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return out
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil || json.Unmarshal(data, &d) != nil {
+		return spacefastDelivery{}, false
 	}
-	_ = json.Unmarshal(data, &out)
-	return out
+	return d, true
 }
 
-func saveSpacefastDeliveries(m map[string]spacefastDelivery) error {
-	path, err := spacefastStatePath()
+// rememberSpacefastDelivery writes one page's record atomically (temp file
+// plus rename) as a 0600 file under a 0700 directory: anonymous page keys
+// are credentials.
+func rememberSpacefastDelivery(stateKey string, d spacefastDelivery) error {
+	dir, name, err := spacefastDeliveryPath(stateKey)
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
+	data, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
 		return err
 	}
-	// 0600 file under a 0700 directory: anonymous page keys are credentials.
-	return writeDownloadUnder(filepath.Dir(path), filepath.Base(path), data)
-}
-
-const (
-	spacefastLockWait  = 10 * time.Second
-	spacefastLockStale = 2 * time.Minute
-)
-
-// rememberSpacefastDelivery records one page under an exclusive lock file and
-// re-reads the state inside the lock, so concurrent deliveries merge their
-// entries instead of the last writer dropping the others.
-func rememberSpacefastDelivery(key string, d spacefastDelivery) error {
-	path, err := spacefastStatePath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	lock := path + ".lock"
-	deadline := time.Now().Add(spacefastLockWait)
-	for {
-		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			_ = f.Close()
-			break
-		}
-		if !os.IsExist(err) {
-			return err
-		}
-		// A lock left by a crashed process would block every later delivery.
-		if info, statErr := os.Stat(lock); statErr == nil && time.Since(info.ModTime()) > spacefastLockStale {
-			_ = os.Remove(lock)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for %s", lock)
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	defer os.Remove(lock)
-	m := loadSpacefastDeliveries()
-	m[key] = d
-	return saveSpacefastDeliveries(m)
+	return writeDownloadUnder(dir, name, data)
 }
 
 // deliverSpacefast publishes body as a page and prints where it went.
@@ -191,7 +154,7 @@ func deliverSpacefast(target string, body []byte) error {
 	}
 	stateKey := spacefastScope(api, token, team) + "|" + t.Name
 
-	prior, havePrior := loadSpacefastDeliveries()[stateKey]
+	prior, havePrior := loadSpacefastDelivery(stateKey)
 	// An anonymous page can only be updated with the key it was created with.
 	if havePrior && (prior.SpaceID == "" || (token == "" && prior.Key == "")) {
 		havePrior = false

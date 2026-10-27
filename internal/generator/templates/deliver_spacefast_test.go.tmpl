@@ -236,9 +236,15 @@ func TestDeliverSpacefastScopesPagesByTeam(t *testing.T) {
 	if _, ok := fake.payloads[3]["space"]; !ok || fake.auths[3] != "" {
 		t.Errorf("anonymous delivery must not reuse an account page, got %v auth=%q", fake.payloads[3], fake.auths[3])
 	}
-	state, _ := json.Marshal(loadSpacefastDeliveries())
-	if strings.Contains(string(state), "sf_test_token") {
-		t.Error("the token must never be written to the state file")
+	for _, team := range []string{"team-a", "team-b"} {
+		d, ok := loadSpacefastDelivery(spacefastScope(srv.URL, "sf_test_token", team) + "|shared-name")
+		if !ok {
+			t.Fatalf("no saved page for %s", team)
+		}
+		raw, _ := json.Marshal(d)
+		if strings.Contains(string(raw), "sf_test_token") {
+			t.Error("the token must never be written to the saved record")
+		}
 	}
 }
 
@@ -264,7 +270,10 @@ func TestDeliverSpacefastConcurrentDeliveriesKeepEveryPage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := len(loadSpacefastDeliveries()); got != n {
-		t.Fatalf("state kept %d pages, want %d", got, n)
+	for i := 0; i < n; i++ {
+		d, ok := loadSpacefastDelivery(spacefastScope(srv.URL, "", "") + fmt.Sprintf("|page-%d", i))
+		if !ok || d.Key == "" {
+			t.Errorf("page-%d lost its saved key", i)
+		}
 	}
 }
