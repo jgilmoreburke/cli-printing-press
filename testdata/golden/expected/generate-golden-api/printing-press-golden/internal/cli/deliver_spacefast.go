@@ -15,11 +15,13 @@ package cli
 // Without a token the page is published anonymously: the receipt carries a
 // private link and a claim link, and the page's key is kept in this CLI's
 // state directory so a later --deliver to the same <name> updates the same
-// page instead of creating another.
+// page instead of creating another. Remembered pages are scoped to the API
+// address, credential, and team they were published with.
 
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -82,6 +84,18 @@ type spacefastDelivery struct {
 	Account  bool   `json:"account,omitempty"` // published with SPACEFAST_TOKEN
 }
 
+// spacefastScope names where a remembered page lives: the API address, the
+// credential, and the team. A page is reused only from the same scope, so a
+// different token or SPACEFAST_TEAM never updates another team's page. The
+// token itself is never stored, only a short hash of it.
+func spacefastScope(api, token, team string) string {
+	if token == "" {
+		return api + "|anonymous"
+	}
+	sum := sha256.Sum256([]byte(token))
+	return api + "|token:" + hex.EncodeToString(sum[:8]) + "|team:" + team
+}
+
 func spacefastStatePath() (string, error) {
 	dir, err := cliutil.StateDir()
 	if err != nil {
@@ -117,6 +131,49 @@ func saveSpacefastDeliveries(m map[string]spacefastDelivery) error {
 	return writeDownloadUnder(filepath.Dir(path), filepath.Base(path), data)
 }
 
+const (
+	spacefastLockWait  = 10 * time.Second
+	spacefastLockStale = 2 * time.Minute
+)
+
+// rememberSpacefastDelivery records one page under an exclusive lock file and
+// re-reads the state inside the lock, so concurrent deliveries merge their
+// entries instead of the last writer dropping the others.
+func rememberSpacefastDelivery(key string, d spacefastDelivery) error {
+	path, err := spacefastStatePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	lock := path + ".lock"
+	deadline := time.Now().Add(spacefastLockWait)
+	for {
+		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_ = f.Close()
+			break
+		}
+		if !os.IsExist(err) {
+			return err
+		}
+		// A lock left by a crashed process would block every later delivery.
+		if info, statErr := os.Stat(lock); statErr == nil && time.Since(info.ModTime()) > spacefastLockStale {
+			_ = os.Remove(lock)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for %s", lock)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	defer os.Remove(lock)
+	m := loadSpacefastDeliveries()
+	m[key] = d
+	return saveSpacefastDeliveries(m)
+}
+
 // deliverSpacefast publishes body as a page and prints where it went.
 func deliverSpacefast(target string, body []byte) error {
 	t, err := parseSpacefastTarget(target)
@@ -128,12 +185,15 @@ func deliverSpacefast(target string, body []byte) error {
 		api = spacefastDefaultAPI
 	}
 	token := strings.TrimSpace(os.Getenv("SPACEFAST_TOKEN"))
-	team := strings.TrimSpace(os.Getenv("SPACEFAST_TEAM"))
+	team := ""
+	if token != "" {
+		team = strings.TrimSpace(os.Getenv("SPACEFAST_TEAM"))
+	}
+	stateKey := spacefastScope(api, token, team) + "|" + t.Name
 
-	deliveries := loadSpacefastDeliveries()
-	prior, havePrior := deliveries[t.Name]
-	// A remembered page is only reusable with the credential that owns it.
-	if havePrior && (prior.Account != (token != "") || (!prior.Account && prior.Key == "")) {
+	prior, havePrior := loadSpacefastDeliveries()[stateKey]
+	// An anonymous page can only be updated with the key it was created with.
+	if havePrior && (prior.SpaceID == "" || (token == "" && prior.Key == "")) {
 		havePrior = false
 	}
 
@@ -148,12 +208,12 @@ func deliverSpacefast(target string, body []byte) error {
 	bearer := token
 	if havePrior {
 		payload["spaceId"] = prior.SpaceID
-		if !prior.Account {
+		if token == "" {
 			bearer = prior.Key
 		}
 	} else {
 		payload["space"] = map[string]any{"slug": t.Name, "title": spacefastTitle(t.Name)}
-		if token != "" && team != "" {
+		if team != "" {
 			payload["teamId"] = team
 		}
 		if t.Public && token != "" {
@@ -191,8 +251,7 @@ func deliverSpacefast(target string, body []byte) error {
 	if d.URL == "" && receipt.Version.ImmutableURL != "" {
 		d.URL = receipt.Version.ImmutableURL
 	}
-	deliveries[t.Name] = d
-	if err := saveSpacefastDeliveries(deliveries); err != nil {
+	if err := rememberSpacefastDelivery(stateKey, d); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: published, but could not remember the page for later updates: %v\n", err)
 	}
 
@@ -309,9 +368,7 @@ func spacefastPublish(api, bearer string, payload map[string]any, files map[stri
 		}
 		_ = json.Unmarshal(raw, &problem)
 		msg := spacefastFirstNonEmpty(problem.Detail, problem.Title, strings.TrimSpace(string(raw)))
-		if len(msg) > 300 {
-			msg = msg[:300] + "…"
-		}
+		msg = spacefastTruncate(msg, 300)
 		return nil, fmt.Errorf("Spacefast returned %s: %s", resp.Status, msg)
 	}
 	var env struct {
@@ -334,6 +391,16 @@ func spacefastRandomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// spacefastTruncate shortens s to at most max runes, never splitting a
+// UTF-8 character.
+func spacefastTruncate(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
+}
+
 func spacefastFirstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -353,11 +420,25 @@ func spacefastTitle(name string) string {
 	return strings.Join(words, " ")
 }
 
+// spacefastDecode parses one JSON value with numbers kept exact
+// (json.Number), so large IDs reach the page and data.json unchanged.
+func spacefastDecode(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("unexpected data after JSON value")
+	}
+	return nil
+}
+
 // spacefastDataFile returns the output as JSON when it parses, so the page
 // ships a machine-readable copy next to the rendered one.
 func spacefastDataFile(body []byte) []byte {
 	var v any
-	if json.Unmarshal(bytes.TrimSpace(body), &v) == nil {
+	if spacefastDecode(bytes.TrimSpace(body), &v) == nil {
 		out, err := json.MarshalIndent(v, "", "  ")
 		if err == nil {
 			return out
@@ -367,24 +448,35 @@ func spacefastDataFile(body []byte) []byte {
 	return out
 }
 
-// spacefastRows finds the record list in a command's JSON output: a top-level
-// array of objects, or the first array of objects under a common envelope key.
-func spacefastRows(v any) ([]map[string]any, bool) {
-	switch x := v.(type) {
-	case []any:
-		rows := make([]map[string]any, 0, len(x))
-		for _, item := range x {
-			m, ok := item.(map[string]any)
-			if !ok {
+// spacefastLocateRows finds the record list in a command's JSON output: a
+// top-level array of objects, or the first array of objects under a common
+// envelope key. It returns that array's raw bytes.
+func spacefastLocateRows(raw []byte) ([]byte, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil, false
+	}
+	switch raw[0] {
+	case '[':
+		var items []json.RawMessage
+		if json.Unmarshal(raw, &items) != nil || len(items) == 0 {
+			return nil, false
+		}
+		for _, item := range items {
+			item = bytes.TrimSpace(item)
+			if len(item) == 0 || item[0] != '{' {
 				return nil, false
 			}
-			rows = append(rows, m)
 		}
-		return rows, len(rows) > 0
-	case map[string]any:
+		return raw, true
+	case '{':
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) != nil {
+			return nil, false
+		}
 		for _, key := range []string{"results", "data", "items", "records", "rows", "entries"} {
-			if inner, ok := x[key]; ok {
-				if rows, ok := spacefastRows(inner); ok {
+			if inner, ok := obj[key]; ok {
+				if rows, ok := spacefastLocateRows(inner); ok {
 					return rows, true
 				}
 			}
@@ -393,17 +485,47 @@ func spacefastRows(v any) ([]map[string]any, bool) {
 	return nil, false
 }
 
+// spacefastRowKeyOrder maps each record field to the position it first
+// appears among the records' own top-level keys, so the table keeps the
+// command's field order. Keys of nested objects and envelopes don't count.
+func spacefastRowKeyOrder(rowsRaw []byte) map[string]int {
+	order := map[string]int{}
+	var items []json.RawMessage
+	if json.Unmarshal(rowsRaw, &items) != nil {
+		return order
+	}
+	for _, item := range items {
+		dec := json.NewDecoder(bytes.NewReader(item))
+		if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+			continue
+		}
+		for dec.More() {
+			tok, err := dec.Token()
+			if err != nil {
+				break
+			}
+			if key, ok := tok.(string); ok {
+				if _, seen := order[key]; !seen {
+					order[key] = len(order)
+				}
+			}
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				break
+			}
+		}
+	}
+	return order
+}
+
 func spacefastCell(v any) string {
 	switch x := v.(type) {
 	case nil:
 		return ""
 	case string:
 		return x
-	case float64:
-		if x == float64(int64(x)) {
-			return fmt.Sprintf("%d", int64(x))
-		}
-		return fmt.Sprintf("%g", x)
+	case json.Number:
+		return x.String()
 	case bool:
 		if x {
 			return "yes"
@@ -415,66 +537,24 @@ func spacefastCell(v any) string {
 	}
 }
 
-// spacefastKeyOrder maps each object key to the position it first appears
-// in the raw JSON, so table columns keep the command's own field order.
-func spacefastKeyOrder(body []byte) map[string]int {
-	order := map[string]int{}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	// One frame per open container. Objects alternate key, value; a frame's
-	// wantKey says the next token in that object is a key.
-	// Only row objects (direct children of an array) contribute, so an
-	// envelope's own keys ({"meta":{"source":…},"results":[…]}) don't
-	// claim column slots.
-	type frame struct {
-		object  bool
-		wantKey bool
-		row     bool
-	}
-	var stack []frame
-	valueDone := func() {
-		if n := len(stack); n > 0 && stack[n-1].object {
-			stack[n-1].wantKey = true
-		}
-	}
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return order
-		}
-		if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].wantKey {
-			if key, ok := tok.(string); ok {
-				if _, seen := order[key]; !seen && stack[n-1].row {
-					order[key] = len(order)
-				}
-				stack[n-1].wantKey = false
-				continue
-			}
-		}
-		switch tok {
-		case json.Delim('{'):
-			inArray := len(stack) > 0 && !stack[len(stack)-1].object
-			stack = append(stack, frame{object: true, wantKey: true, row: inArray})
-		case json.Delim('['):
-			stack = append(stack, frame{})
-		case json.Delim('}'), json.Delim(']'):
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-			valueDone()
-		default:
-			valueDone()
-		}
-	}
-}
-
 func renderSpacefastPage(name string, body []byte) []byte {
+	trimmed := bytes.TrimSpace(body)
 	var parsed any
-	isJSON := json.Unmarshal(bytes.TrimSpace(body), &parsed) == nil
+	isJSON := spacefastDecode(trimmed, &parsed) == nil
+
+	var rows []map[string]any
+	var order map[string]int
+	if isJSON {
+		if rowsRaw, ok := spacefastLocateRows(trimmed); ok && spacefastDecode(rowsRaw, &rows) == nil {
+			// Columns in the order the command emitted them (Go maps drop it).
+			order = spacefastRowKeyOrder(rowsRaw)
+		} else {
+			rows = nil
+		}
+	}
 
 	var content strings.Builder
-	if rows, ok := spacefastRows(parsed); isJSON && ok {
-		// Columns in the order the command emitted them (Go maps drop it).
-		order := spacefastKeyOrder(body)
+	if len(rows) > 0 {
 		var cols []string
 		seen := map[string]bool{}
 		for _, r := range rows {
