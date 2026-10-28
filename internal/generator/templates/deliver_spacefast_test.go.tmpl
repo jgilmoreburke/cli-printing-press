@@ -10,10 +10,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"unicode/utf8"
+
+	"{{modulePath}}/internal/cliutil"
+	"{{modulePath}}/internal/cliutil/testenv"
 )
 
 func TestParseSpacefastDeliverSink(t *testing.T) {
@@ -83,11 +87,9 @@ func TestSpacefastTruncateKeepsUTF8(t *testing.T) {
 }
 
 func TestDeliverSpacefastAnonymousThenUpdate(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	testenv.Isolate(t, cliutil.StateDir)
 	t.Setenv("SPACEFAST_TOKEN", "")
 	t.Setenv("SPACEFAST_TEAM", "")
-	t.Setenv("{{envName .Name}}_HOME", t.TempDir())
 
 	var calls []map[string]any
 	var auths []string
@@ -195,9 +197,7 @@ func (f *spacefastFakeAPI) handler(t *testing.T) http.Handler {
 
 func spacefastTestEnv(t *testing.T, apiURL string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	t.Setenv("{{envName .Name}}_HOME", t.TempDir())
+	testenv.Isolate(t, cliutil.StateDir)
 	t.Setenv("SPACEFAST_API_URL", apiURL)
 	t.Setenv("SPACEFAST_TOKEN", "")
 	t.Setenv("SPACEFAST_TEAM", "")
@@ -275,5 +275,25 @@ func TestDeliverSpacefastConcurrentDeliveriesKeepEveryPage(t *testing.T) {
 		if !ok || d.Key == "" {
 			t.Errorf("page-%d lost its saved key", i)
 		}
+	}
+}
+
+func TestSpacefastRefusesPlaintextCredentials(t *testing.T) {
+	refused := []string{"http://example.com", "http://10.0.0.5:8080", "http://[::ffff:8.8.8.8]"}
+	for _, raw := range refused {
+		u, _ := url.Parse(raw)
+		if spacefastPlaintextCredentialError(u) == nil {
+			t.Errorf("%s: credentials over plaintext http should be refused", raw)
+		}
+	}
+	allowed := []string{"https://api.spacefast.com", "http://localhost:8080", "http://127.0.0.1:9000", "http://[::1]:9000", "http://LOCALHOST."}
+	for _, raw := range allowed {
+		u, _ := url.Parse(raw)
+		if err := spacefastPlaintextCredentialError(u); err != nil {
+			t.Errorf("%s: should be allowed, got %v", raw, err)
+		}
+	}
+	if _, err := spacefastPublish("http://example.com", "secret-token", map[string]any{}, nil); err == nil || !strings.Contains(err.Error(), "plaintext") {
+		t.Errorf("spacefastPublish to non-loopback http with a token = %v, want plaintext refusal", err)
 	}
 }
