@@ -30,7 +30,9 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/netip"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -253,6 +255,24 @@ type spacefastReceipt struct {
 	} `json:"next"`
 }
 
+// spacefastPlaintextCredentialError refuses to send a credential (a
+// SPACEFAST_TOKEN or a saved page key) over plain http unless the target is
+// loopback, so a local test server still works. It mirrors the generated API
+// client's plaintextCredentialError, which this separate HTTP client bypasses.
+func spacefastPlaintextCredentialError(u *url.URL) error {
+	if u == nil || !strings.EqualFold(u.Scheme, "http") {
+		return nil
+	}
+	host := strings.TrimSuffix(strings.TrimSpace(u.Hostname()), ".")
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	if addr, err := netip.ParseAddr(host); err == nil && addr.Unmap().IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("refusing to send Spacefast credentials over plaintext http to %s; use https", host)
+}
+
 func spacefastPublish(api, bearer string, payload map[string]any, files map[string][]byte) (*spacefastReceipt, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -303,6 +323,9 @@ func spacefastPublish(api, bearer string, payload map[string]any, files map[stri
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", spacefastClientVersion)
 	if bearer != "" {
+		if err := spacefastPlaintextCredentialError(req.URL); err != nil {
+			return nil, err
+		}
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	} else {
 		// Anonymous publishes need a caller-held principal to make the
